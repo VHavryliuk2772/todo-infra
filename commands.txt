@@ -1,0 +1,13 @@
+Local:
+kubectl config use-context k3d-k3s-default
+kubectl apply -k kubernetes/overlays/local
+
+GKE:
+kubectl config use-context gke_dwk-gke-482113_europe-north1-b_dwk-cluster
+kubectl apply -k kubernetes/overlays/gke
+
+Health-checks:
+kubectl -n project run -it --rm --restart=Never --image=curlimages/curl:8.6.0 curl -- sh
+curl -i http://todo-app-svc:2222/
+curl -i http://todo-backend-svc:2233/
+

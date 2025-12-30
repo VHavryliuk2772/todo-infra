@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: todo-backend
+  template:
+    metadata:
+      labels:
+        app: todo-backend
+    spec:
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for postgres..."
+              until pg_isready -h postgres-svc -p 5432 -U postgres; do
+                sleep 2
+              done
+              echo "Postgres is ready."
+
+      containers:
+        - name: todo-backend
+          imagePullPolicy: Always
+          image: havryliukv2772/todo-backend
+          env:
+            - name: ConnectionStrings__Postgres
+              valueFrom:
+                secretKeyRef:
+                  name: todo-db-secret
+                  key: ConnectionStrings__Postgres

@@ -1,0 +1,151 @@
+name: Deploy (infra)
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+    inputs:
+      branch:
+        required: true
+        type: string
+      service:
+        required: true
+        type: choice
+        options: [todo-app, todo-backend]
+      image:
+        required: true
+        type: string
+
+env:
+  REGISTRY_REGION: europe-north1
+  GKE_CLUSTER: dwk-cluster
+  GKE_ZONE: europe-north1-b
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GKE_SA_KEY }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          location: ${{ env.GKE_ZONE }}
+
+      - name: Resolve payload
+        id: payload
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BRANCH="${{ inputs.branch }}"
+            SERVICE="${{ inputs.service }}"
+            IMAGE="${{ inputs.image }}"
+          else
+            BRANCH="${{ github.event.client_payload.branch }}"
+            SERVICE="${{ github.event.client_payload.service }}"
+            IMAGE="${{ github.event.client_payload.image }}"
+          fi
+
+          # Namespace policy
+          if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+            NS="project"
+          else
+            NS="$BRANCH"
+          fi
+
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "SERVICE=$SERVICE" >> $GITHUB_ENV
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "NS=$NS" >> $GITHUB_ENV
+
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Load current image state (ConfigMap)
+        shell: bash
+        run: |
+          set -e
+
+          # Defaults: base images (will work for first deploy if no state)
+          APP_IMAGE_DEFAULT="havryliukv2772/todo-app:latest"
+          BACK_IMAGE_DEFAULT="havryliukv2772/todo-backend:latest"
+
+          CM_JSON="$(kubectl -n "$NS" get configmap todo-images -o json 2>/dev/null || true)"
+          if [[ -n "$CM_JSON" ]]; then
+            APP_IMAGE="$(echo "$CM_JSON" | jq -r '.data.TODO_APP_IMAGE // empty')"
+            BACK_IMAGE="$(echo "$CM_JSON" | jq -r '.data.TODO_BACKEND_IMAGE // empty')"
+          fi
+
+          APP_IMAGE="${APP_IMAGE:-$APP_IMAGE_DEFAULT}"
+          BACK_IMAGE="${BACK_IMAGE:-$BACK_IMAGE_DEFAULT}"
+
+          # Apply update from dispatch
+          if [[ "$SERVICE" == "todo-app" ]]; then
+            APP_IMAGE="$IMAGE"
+          elif [[ "$SERVICE" == "todo-backend" ]]; then
+            BACK_IMAGE="$IMAGE"
+          else
+            echo "Unknown service: $SERVICE" >&2
+            exit 1
+          fi
+
+          echo "APP_IMAGE=$APP_IMAGE" >> $GITHUB_ENV
+          echo "BACK_IMAGE=$BACK_IMAGE" >> $GITHUB_ENV
+
+      - name: Persist image state (ConfigMap)
+        run: |
+          kubectl -n "$NS" apply -f - <<YAML
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: todo-images
+          data:
+            TODO_APP_IMAGE: "${APP_IMAGE}"
+            TODO_BACKEND_IMAGE: "${BACK_IMAGE}"
+          YAML
+
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2.1.0
+
+      - name: Deploy overlay/gke with branch namespace + images
+        shell: bash
+        run: |
+          set -e
+
+          # Work in temp dir so we don't commit edits back
+          rm -rf /tmp/k && mkdir -p /tmp/k
+          cp -R kubernetes/overlays/gke /tmp/k/gke
+          cp -R kubernetes/base /tmp/k/base
+
+          # Fix relative path inside overlay (../../base) -> ../base
+          # easiest: edit kustomization to point to our copied base
+          # We'll rewrite resources line: - ../../base  -> - ../base
+          sed -i 's|- ../../base|- ../base|g' /tmp/k/gke/kustomization.yaml
+
+          pushd /tmp/k/gke
+
+          kustomize edit set namespace "$NS"
+
+          # set images by matching current base image names
+          kustomize edit set image havryliukv2772/todo-app="$APP_IMAGE"
+          kustomize edit set image havryliukv2772/todo-backend="$BACK_IMAGE"
+
+          kustomize build . | kubectl apply -n "$NS" -f -
+
+          popd
+
+      - name: Rollout status
+        run: |
+          kubectl -n "$NS" rollout status deployment/todo-backend --timeout=180s || true
+          kubectl -n "$NS" rollout status deployment/todo-app --timeout=180s || true
+
+      - name: Print Gateway/Service info
+        run: |
+          kubectl -n "$NS" get svc,po,gateway,httproute 2>/dev/null || true
