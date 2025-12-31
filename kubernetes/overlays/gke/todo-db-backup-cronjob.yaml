@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: todo-db-backup
+spec:
+  schedule: "0 2 * * *"   # раз на добу о 02:00
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: google/cloud-sdk:slim
+              env:
+                - name: GOOGLE_APPLICATION_CREDENTIALS
+                  value: /secrets/key.json
+                - name: PGHOST
+                  value: postgres-svc
+                - name: PGPORT
+                  value: "5432"
+                - name: PGDATABASE
+                  value: todo
+                - name: PGUSER
+                  value: postgres
+                - name: PGPASSWORD
+                  value: postgres
+                - name: BUCKET
+                  value: todo-db-backups-dwk-gke-482113
+              volumeMounts:
+                - name: gcs-key
+                  mountPath: /secrets
+                  readOnly: true
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+                  FILE="/tmp/todo-backup-$TIMESTAMP.sql"
+
+                  echo "Creating database dump..."
+                  pg_dump > $FILE
+
+                  echo "Uploading to GCS..."
+                  gsutil cp $FILE gs://$BUCKET/
+
+                  echo "Backup completed: $FILE"
+          volumes:
+            - name: gcs-key
+              secret:
+                secretName: gcs-backup-key
